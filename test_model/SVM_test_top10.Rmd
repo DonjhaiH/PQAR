@@ -1,0 +1,205 @@
+---
+title: "SVM_test_top10"
+output: html_document
+date: "2024-08-16"
+---
+
+
+# Get top 10 variables and prepare df for model
+```{r}
+# Function to extract the top 10 absolute weight vectors
+get_top_10 <- function(matrix) {
+  # Convert matrix to a vector with absolute values
+  abs_values <- abs(matrix)
+  
+  # Get the indices of the top 10 values
+  top_10 <- order(abs_values, decreasing = TRUE)[1:10]
+  
+  return(top_10)
+}
+
+#cn_dem_var[order(abs(cn_rgcca$a$block2), decreasing = T)[1:10], ]
+#cn_dem_var[379,]
+#cn[379,]
+
+#ad[order(abs(ad_rgcca$a$block2), decreasing = T)[1:10], ]
+
+
+cn_pet_w <- get_top_10(cn_rgcca$a$block1)
+cn_snp_w <- get_top_10(cn_rgcca$a$block2)
+cn_t1_w <-  get_top_10(cn_rgcca$a$block3)
+
+ad_pet_w <- get_top_10(ad_rgcca$a$block1)
+ad_snp_w <-  get_top_10(ad_rgcca$a$block2)
+ad_t1_w <-  get_top_10(ad_rgcca$a$block3)
+
+# cn_dem_var[1:nrow(cn), c(1:7, cn_snp_w)]
+# cn_dem_var[1:nrow(cn), c(1:7, cn_snp_w, cn_pet_w, cn_t1_w)] --> use this for cn, then do the same for ad
+top_10_cn_pet <- combined_dems[,c(1:3, cn_pet_w)]
+top_10_cn_snp <- combined_dems[,cn_snp_w+120]
+top_10_cn_t1 <- combined_dems[ , cn_t1_w+120+397]
+
+
+
+top_10_ad_pet <-combined_dems[,ad_pet_w]
+top_10_ad_snp <- combined_dems[,ad_snp_w+120]
+top_10_ad_t1 <-combined_dems[,ad_t1_w+120+397]
+
+#top_10_cn_pet
+#top_10_cn_snp
+#top_10_cn_t1 
+
+#top_cn <- merge(top_10_cn_pet, top_10_cn_snp, by = "ID" , sort=F)
+top_cn <- cbind(top_10_cn_pet, top_10_cn_snp, top_10_cn_t1)
+#top_cn_df <- cbind(top_cn, cn_dem_var$age, cn_dem_var$gender, cn_dem_var$race)
+
+#dim(top_cn)
+#top_10_ad_snp
+#top_10_ad_pet
+#top_10_ad_t1 
+
+top_ad <- cbind(top_10_ad_pet, top_10_ad_snp, top_10_ad_t1)
+
+combined3 <- cbind(top_cn, top_ad)
+```
+
+
+```{r}
+library(sparseSVM)
+library(caret)
+library(dplyr)
+library(mccr)
+library(tidyverse)
+
+# Ensure combined3 is a data frame
+combined3 <- as.data.frame(combined3)
+num <- 10
+
+# Identify and drop duplicate columns
+duplicated_columns <- duplicated(t(combined3))
+combined3 <- combined3[, !duplicated_columns]
+
+# Ensure response column is properly set
+combined3$response <- c(rep(0, 332), rep(1, 217))
+
+# Initialize variables to store the results
+specificity_list <- numeric(num)
+sensitivity_list <- numeric(num)
+accuracy_list <- numeric(num)
+mcc_list <- numeric(num)
+non_zero_coefficients_list <- vector("list", num)
+
+# Define grid search parameters
+alpha_values <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+lambda_values <- 10^seq(-8, -2, length = 200)  # Smaller range for lambda
+
+for (i in 1:num) {
+  set.seed(333 + i)  # Change seed for each iteration
+
+  # Shuffle the rows
+  shuffled_df <- combined3 %>% sample_n(nrow(.))
+
+  # Split the data into training and testing sets with stratification
+  split <- initial_split(shuffled_df, prop = 7/10)
+  train <- training(split)
+  test <- testing(split)
+
+  # Ensure complete cases
+  train <- train[complete.cases(train), ]
+  test <- test[complete.cases(test), ]
+
+  # Convert categorical variables to numeric
+  train$Gender <- as.numeric(factor(train$Gender, levels = c("Male", "Female")))
+  train$Race <- as.numeric(factor(train$Race, levels = c("White", "Black", "Asian", "Am Indian/Alaskan", "More than one")))
+
+  test$Gender <- as.numeric(factor(test$Gender, levels = c("Male", "Female")))
+  test$Race <- as.numeric(factor(test$Race, levels = c("White", "Black", "Asian", "Am Indian/Alaskan", "More than one")))
+
+  # Create the predictor matrix (excluding the response column)
+  x_train <- as.matrix(train %>% select(-response))
+  y_train <- train$response
+
+  x_test <- as.matrix(test %>% select(-response))
+  y_test <- test$response
+
+  best_mcc <- -Inf
+  best_model <- NULL
+  best_alpha <- NULL
+  best_lambda <- NULL
+
+  for (alpha in alpha_values) {
+    # Perform cross-validation to find the best lambda for each alpha
+    cv_sparse_svm <- cv.sparseSVM(x_train, y_train, nfolds = 5, alpha = alpha, lambda = lambda_values)
+
+    # Get the best lambda value
+    best_lambda_tmp <- cv_sparse_svm$lambda.min
+
+    # Predict on the test set
+    predicted_classes2 <- predict(cv_sparse_svm, X = x_test, lambda = best_lambda_tmp, type = "class")
+
+    # Convert predicted_classes2 and y_test to numeric
+    predicted_classes2 <- as.numeric(as.character(predicted_classes2))
+    y_test <- as.numeric(as.character(y_test))
+
+    # Check for NA values
+    if (any(is.na(predicted_classes2)) || any(is.na(y_test))) {
+      next  # Skip this iteration if there are NAs
+    }
+
+    # Calculate MCC using the true and predicted classes directly
+    MCC <- mccr::mccr(y_test, predicted_classes2)
+
+    # Update the best model if the current one is better
+    if (MCC > best_mcc) {
+      best_mcc <- MCC
+      best_model <- cv_sparse_svm
+      best_alpha <- alpha
+      best_lambda <- best_lambda_tmp
+    }
+  }
+
+  if (!is.null(best_model)) {
+    # Predict on the test set with the best model
+    predicted_classes2 <- predict(best_model, X = x_test, lambda = best_lambda, type = "class")
+
+    # Convert predicted_classes2 and y_test to numeric
+    predicted_classes2 <- as.numeric(as.character(predicted_classes2))
+    y_test <- as.numeric(as.character(y_test))
+
+    # Create the confusion matrix
+    confusion_matrix_sparse_svm <- confusionMatrix(factor(predicted_classes2, levels = c(0, 1), labels = c("CN", "AD")),
+                                                   factor(y_test, levels = c(0, 1), labels = c("CN", "AD")),
+                                                   positive = "AD")
+
+    specificity_list[i] <- confusion_matrix_sparse_svm$byClass["Specificity"]
+    sensitivity_list[i] <- confusion_matrix_sparse_svm$byClass["Sensitivity"]
+    accuracy_list[i] <- confusion_matrix_sparse_svm$overall["Accuracy"]
+    mcc_list[i] <- best_mcc
+
+    # Extract non-zero coefficients
+    coefficients <- coef(best_model, s = best_lambda)
+    non_zero_indices <- which(coefficients != 0)
+    non_zero_coefficients_list[[i]] <- colnames(x_train)[non_zero_indices]
+  }
+}
+
+# Calculate averages
+avg_specificity <- mean(specificity_list, na.rm = TRUE)
+avg_sensitivity <- mean(sensitivity_list, na.rm = TRUE)
+avg_accuracy <- mean(accuracy_list, na.rm = TRUE)
+avg_mcc <- mean(mcc_list, na.rm = TRUE)
+
+sd_specificity <- sd(specificity_list, na.rm = TRUE)
+sd_sensitivity <- sd(sensitivity_list, na.rm = TRUE)
+sd_accuracy <- sd(accuracy_list, na.rm = TRUE)
+sd_mcc <- sd(mcc_list, na.rm = TRUE)
+
+cat("Average Specificity:", avg_specificity, "\n")
+cat("Standard Deviation of Specificity:", sd_specificity, "\n")
+cat("Average Sensitivity:", avg_sensitivity, "\n")
+cat("Standard Deviation of Sensitivity:", sd_sensitivity, "\n")
+#cat("Average Accuracy:", avg_accuracy, "\n")
+#cat("Standard Deviation of Accuracy:", sd_accuracy, "\n")
+cat("Average MCC:", avg_mcc, "\n")
+cat("Standard Deviation of MCC:", sd_mcc, "\n")
+```
