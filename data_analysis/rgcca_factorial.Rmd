@@ -1,0 +1,201 @@
+---
+title: "rgcca_factorial"
+output: html_document
+date: "2024-08-16"
+---
+
+# Import libraries & data
+```{r setup, include=FALSE}
+rm(list=ls())
+# Load necessary libraries
+library(tidymodels)
+library(sparseSVM)
+library(caret)
+library(dplyr)
+library(mccr)  # Load the mccr package
+library(RGCCA)
+
+#Import data
+
+pet_ad <- read.table("/Users/donjhaiholland/PQAR_Project/PETdata_AD_centered.txt", header=FALSE)
+pet_cn <- read.table("/Users/donjhaiholland/PQAR_Project/PETdata_CN_centered.txt", header=FALSE)
+#snp data
+snp_ad <- read.table("/Users/donjhaiholland/PQAR_Project/SNPdata_AD_centered.txt", header=FALSE)
+snp_cn <- read.table("/Users/donjhaiholland/PQAR_Project/SNPdata_CN_centered.txt", header=FALSE)
+#t1 data
+t1_ad <- read.table("/Users/donjhaiholland/PQAR_Project/T1data_AD_centered.txt", header=FALSE)
+t1_cn <- read.table("/Users/donjhaiholland/PQAR_Project/T1data_CN_centered.txt", header=FALSE)
+
+cn_variables <- read.csv("/Users/donjhaiholland/PQAR_Project/variable_name_cn.csv", header=T)
+ad_variables <- read.csv("/Users/donjhaiholland/PQAR_Project/variable_name_ad.csv", header=T)
+id <- read.table("/Users/donjhaiholland/PQAR_Project/ImgGWAS_subjects.txt", header=T)
+demographics <- read.csv("/Users/donjhaiholland/PQAR_Project/ADNIMERGE.csv", header=T)
+
+roi_names <- read.table("/Users/donjhaiholland/PQAR_Project/ROInames.txt", header=F)
+snp_names <- read.table("/Users/donjhaiholland/PQAR_Project/SNPnames.txt", header=F)
+```
+
+
+## Create Clean Tables to combine
+
+
+  # create data frame with demographics
+```{r}
+# create data frame with demographics
+#select id and status column in id table
+id_clean <- id %>%
+  select(
+    status,
+    ID = alternative_id_1)
+
+#filter baseline cases and select needed demographics
+demographics_clean <- demographics %>%
+  filter(VISCODE == "bl") %>%
+  select(
+    ID = PTID,
+    Age = AGE,
+    Gender = PTGENDER,
+    code = VISCODE,
+    Race = PTRACCAT,
+    ethnicity = PTETHCAT)
+
+# merge tables together
+dem_id  <-  merge(id_clean, demographics_clean, by = "ID" , sort=F)
+dim(dem_id)
+
+# check table for sample size match
+#dem_id %>%
+  #group_by(status) %>%
+  #count(status)
+
+# separate each group into its on df
+cn_dem <- dem_id %>% 
+  filter(status == "CN")
+dim(cn_dem)
+
+ad_dem <- dem_id %>% 
+  filter(status == "AD")
+dim(ad_dem)
+```
+
+  # create df with variable names
+```{r}
+## create df with variable names
+add_var_names <- function(matrix, df) {
+  
+  # transpose matrix
+  matrix_t <- t(matrix)
+  
+  # transpose df, convert to vector, add column names to matrix
+  colnames(matrix_t) <-  as.vector(unlist(c(t(df))))
+  
+  # convert to dataframe
+  df_new = as.data.frame(matrix_t)
+  
+  return (df_new)
+}
+
+pet_var1 <- add_var_names(pet_cn, roi_names)
+t1_var1 <- add_var_names(t1_cn, roi_names)
+snp_var1 <- add_var_names(snp_cn, snp_names)
+
+colnames(pet_var1) <- paste0("pet_", colnames(pet_var1))
+colnames(snp_var1) <- paste0("snp_", colnames(snp_var1))
+colnames(t1_var1) <- paste0("t1_", colnames(t1_var1))
+
+
+pet_var <- add_var_names(pet_ad, roi_names)
+t1_var <- add_var_names(t1_ad, roi_names)
+snp_var <- add_var_names(snp_ad, snp_names)
+
+colnames(pet_var) <- paste0("pet_", colnames(pet_var))
+colnames(snp_var) <- paste0("snp_", colnames(snp_var))
+colnames(t1_var) <- paste0("t1_", colnames(t1_var))
+
+
+cn1 <- as.data.frame(cbind(pet_var1, snp_var1, t1_var1))
+ad1 <- as.data.frame(cbind(pet_var,snp_var,t1_var))
+
+ad_group = list((pet_var1),(snp_var1),(t1_var1))
+cn_group = list((pet_var),(snp_var),(t1_var))
+```
+
+  # combine demogrphics w/ variables
+```{r}
+#combine demographics w/ respective variables
+cn_dem_var <- cbind(cn_dem,cn1)
+dim(cn_dem_var)
+
+cn_dem_var <- cn_dem_var[,-c(2,5,7)]
+row.names(cn_dem_var) <- cn_dem_var$ID
+cn_dem_var <- cn_dem_var[,-1]
+cn_dem_var  <- cn_dem_var[complete.cases(cn_dem_var), ]
+cn_dem_var$Age <- (cn_dem_var$Age- mean(cn_dem_var$Age)) / sd(cn_dem_var$Age)
+
+
+ad_dem_var <- cbind(ad_dem, ad1)
+dim(ad_dem_var)
+
+ad_dem_var <- ad_dem_var[,-c(2,5,7)]
+row.names(ad_dem_var) <- ad_dem_var$ID
+ad_dem_var <- ad_dem_var[,-1]
+colnames(ad_dem_var)[1:3] <-  c("Age", "Gender", "Race")
+ad_dem_var$Age <- (ad_dem_var$Age- mean(ad_dem_var$Age)) / sd(ad_dem_var$Age)
+
+#combine clean tables
+combined_dems <- rbind(cn_dem_var,ad_dem_var)
+
+
+
+```
+
+
+
+```{r}
+# Set regularization parameters (tau)
+
+
+cn_optimal_tau <- c(0.05263158, 0.05263158, 0.05263158)
+ad_optimal_tau <- c(0.03448276, 0.03448276, 0.03448276)
+# Set the scheme for covariance maximization
+scheme <- "factorial"
+#cn_ncomp <- c(1,1,1)
+#cn_sparsity <- c(0.2,0.2,0.2)
+
+# Fit the RGCCA model
+cn_rgcca <- rgcca(
+  blocks = cn_group,
+  connection = NULL,
+  tau = cn_optimal_tau,
+  ncomp = 1,
+  scheme = scheme,
+  scale = FALSE,
+  init= "random",
+  verbose= TRUE,
+  sparsity = 0.5
+)
+#cn_rgcca
+
+plot(cn_rgcca)
+
+#cn_rgcca$a
+
+
+# Set the scheme for covariance maximization
+
+
+# Fit the RGCCA model
+ad_rgcca <- rgcca(
+  blocks = ad_group,
+  connection = NULL,
+  tau = ad_optimal_tau,
+  ncomp = 1,
+  scheme = scheme,
+  scale = FALSE,
+  init= "random",
+  verbose= TRUE,
+  sparsity = 0.5
+)
+
+plot(ad_rgcca)
+```
